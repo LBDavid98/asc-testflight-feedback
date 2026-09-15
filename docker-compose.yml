@@ -1,0 +1,79 @@
+# asc-testflight-feedback — TestFlight beta feedback for every app, one ingestion.
+#
+#   cp .env.example .env    # fill in the three App Store Connect values
+#   docker compose up -d
+#   curl -s localhost:8000/health
+#
+# This file is self-contained: it brings its own Postgres. If you already run
+# one, delete the `postgres` service and point PGHOST at yours.
+
+name: asc-testflight-feedback
+
+services:
+  api:
+    build: .
+    image: asc-testflight-feedback:local
+    restart: unless-stopped
+    mem_limit: 512m
+    mem_reservation: 64m
+    security_opt:
+      - no-new-privileges:true
+    # Run as the host uid that owns the key file. The image builds a uid 10001
+    # user, but a host that grants no passwordless sudo cannot chown the key to
+    # it — and widening the key to world-readable to suit the image would be the
+    # wrong trade. Match the container to the key; do not loosen the key to suit
+    # the container.
+    user: "${RUN_AS_UID:-1000}:${RUN_AS_GID:-1000}"
+    env_file:
+      - .env
+    environment:
+      PGHOST: postgres
+      PGDATABASE: ${POSTGRES_DB:-testflight}
+      # Where the .p8 lands inside the container. The file itself is mounted
+      # read-only from the host; see the volume below.
+      ASC_PRIVATE_KEY_PATH: /run/secrets/asc_key.p8
+      POLL_SECONDS: ${POLL_SECONDS:-900}
+    volumes:
+      # Read-only, and a FILE not a directory, so nothing else in the key
+      # directory is exposed to the container.
+      #
+      # TRAP: a single-file bind mount is pinned to the file's inode. Replacing
+      # the key on the host (rather than editing in place) leaves this container
+      # reading the OLD key until it is RESTARTED — `docker restart`, not a
+      # reload.
+      - ${ASC_KEY_HOST_PATH:-./secrets/asc_key.p8}:/run/secrets/asc_key.p8:ro
+    ports:
+      # Bound to loopback on purpose. This service holds an Apple credential and
+      # has no authentication of its own — it is meant to sit behind whatever
+      # already fronts your other services, not on an interface. Change the bind
+      # address only once something is authenticating in front of it.
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=8).status==200 else 1)"]
+      interval: 60s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+
+  postgres:
+    # Digest-pinned: a floating tag means a rebuild months from now silently
+    # ships a different database than the one this was verified against.
+    image: postgres:16-alpine@sha256:cf78e76683b9ca8c5733cbbdce6c9262b45b6767934dd0a95e671f9a0fc20685
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PGUSER:-testflight}
+      POSTGRES_PASSWORD: ${PGPASSWORD:?set PGPASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-testflight}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PGUSER:-testflight}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
